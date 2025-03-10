@@ -1,0 +1,306 @@
+import json
+import os
+import numpy as np
+import streamlit as st
+import faiss
+import PyPDF2
+import pdfplumber  
+from dotenv import load_dotenv
+from typing import List, Dict, Optional
+from langchain_openai import AzureChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tiktoken
+import ollama
+from pdf2image import convert_from_path  
+from PIL import Image  
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+from azure.storage.blob import BlobServiceClient
+import logging  
+import hashlib
+import google.generativeai as genai
+
+
+
+
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+logging.basicConfig(level=logging.DEBUG)
+
+AZURE_FORM_RECOGNIZER_ENDPOINT = os.getenv("AZURE_FORM_RECOGNIZER_ENDPOINT")
+AZURE_FORM_RECOGNIZER_KEY = os.getenv("AZURE_FORM_RECOGNIZER_KEY")
+doc_client = DocumentAnalysisClient(AZURE_FORM_RECOGNIZER_ENDPOINT, AzureKeyCredential(AZURE_FORM_RECOGNIZER_KEY))
+# Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_STORAGE_CONTAINER_NAME = os.getenv("AZURE_STORAGE_CONTAINER_NAME")
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
+
+llm = AzureChatOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version="2024-02-15-preview",
+    deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    temperature=0.7
+)
+embedding_model = HuggingFaceEmbeddings(model_name="hkunlp/instructor-base")
+
+USERS = {
+    "admin": {
+        "password": hashlib.sha256("admin123".encode()).hexdigest(),
+        "role": "admin"
+    },
+    "user": {
+        "password": hashlib.sha256("user123".encode()).hexdigest(),
+        "role": "user"
+    }
+}
+
+ROLE_PERMISSIONS = {
+    "admin": ["upload", "query", "feedback", "view_all_feedback"],
+    "user": ["query", "upload", "feedback"]
+}
+
+def check_password(username: str, password: str) -> bool:
+    """Verify username and password."""
+    if username not in USERS:
+        return False
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    return hashed_password == USERS[username]["password"]
+
+def get_user_role(username: str) -> Optional[str]:
+    """Get role for a given username."""
+    return USERS.get(username, {}).get("role")
+
+def load_feedback(filepath="feedback_log.json") -> List[Dict]:
+    """Load feedback from a JSON file."""
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            return json.load(f)
+    return []
+
+def save_feedback(feedback_data, filepath="feedback_log.json"):
+    """Save feedback to a JSON file."""
+    data = load_feedback(filepath)
+    data.append(feedback_data)
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+
+def login_ui():
+    """Display login UI and handle authentication."""
+    # Initialize session state variables
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "username" not in st.session_state:
+        st.session_state.username = None
+    if "role" not in st.session_state:
+        st.session_state.role = None
+    if "login_attempted" not in st.session_state:
+        st.session_state.login_attempted = False
+
+    if not st.session_state.authenticated:
+        st.title("Login")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            username = st.text_input("Username", key="username_input")
+            password = st.text_input("Password", type="password", key="password_input")
+            login_button = st.button("Login")
+
+            if login_button:
+                st.session_state.login_attempted = True
+                if check_password(username, password):
+                    st.session_state.authenticated = True
+                    st.session_state.username = username
+                    st.session_state.role = get_user_role(username)
+                    st.success(f"Welcome {username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+                    
+        # Show login credentials for testing
+        with col2:
+            st.markdown("""
+            ### Test Credentials
+            **Admin:**
+            - Username: admin
+            - Password: admin123
+            
+            **User:**
+            - Username: user
+            - Password: user123
+            """)
+        return False
+    return True
+
+def extract_text_and_images_from_pdf(pdf_file):
+    """Extract text and images from uploaded PDF file."""
+    text = ""
+    images = []
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            extracted_text = [page.extract_text() for page in pdf.pages if page.extract_text() is not None]
+            text = "\n".join(extracted_text) if extracted_text else ""
+    except Exception as e:
+        print(f"pdfplumber extraction failed: {e}")
+    try:
+        images = convert_from_path(pdf_file.name)  # Convert PDF pages to images
+    except Exception as e:
+        print(f"Error extracting images: {e}")
+    return text, images
+
+def extract_text_from_image(image):
+    """Extract text from an image using Azure Document Intelligence OCR."""
+    try:
+        from io import BytesIO
+        image_stream = BytesIO()
+        image.save(image_stream, format="PNG")
+        image_stream.seek(0)
+        poller = doc_client.begin_analyze_document("prebuilt-read", document=image_stream)
+        result = poller.result()
+        text = "\n".join([line.content for page in result.pages for line in page.lines])
+        return text
+    except Exception as e:
+        print(f"Error extracting text from image: {e}")
+        return ""
+
+def upload_text_to_blob(file_name, content):
+    """Upload extracted text to Azure Blob Storage."""
+    try:
+        blob_client = container_client.get_blob_client(file_name)
+        blob_client.upload_blob(content, overwrite=True)
+        print(f"Uploaded {file_name} to Azure Blob Storage")
+    except Exception as e:
+        print(f"Error uploading to Azure Storage: {e}")
+
+def chunk_text(text: str, max_tokens: int = 2000, overlap: int = 200) -> List[str]:
+    """Efficiently split text into chunks with overlap."""
+    encoding = tiktoken.encoding_for_model("gpt-4")
+    tokens = encoding.encode(text)
+    num_tokens = len(tokens)
+    return [encoding.decode(tokens[i:min(i + max_tokens, num_tokens)])
+            for i in range(0, num_tokens, max_tokens - overlap)]
+
+def get_embedding(texts: List[str]) -> List[List[float]]:
+    """Get embeddings for multiple text chunks at once using HuggingFaceEmbeddings."""
+    try:
+        embeddings = embedding_model.embed_documents(texts)
+        return embeddings
+    except Exception as e:
+        print(f"Error getting embeddings: {e}")
+        return [None] * len(texts)
+
+def create_faiss_index(text_chunks):
+    """Create a FAISS vector store from text chunks."""
+    embeddings = get_embedding(text_chunks)
+    embedding_array = np.array(embeddings, dtype=np.float32)
+    faiss_index = FAISS.from_texts(
+        texts=text_chunks,
+        embedding=embedding_model
+    )
+    return faiss_index
+
+
+
+def query_llm(query, context, feedback_history=None):
+    """Query the Gemini model."""
+    try:
+        feedback_prompt = ""
+        if feedback_history:
+            feedback_prompt = "\n\nPrevious Feedback:\n"
+            for feedback in feedback_history:
+                feedback_prompt += f"- Question: {feedback['query']}\n  Feedback: {feedback['comments']}\n"
+        
+        prompt = f"""Context: {context}
+        Question: {query}{feedback_prompt}
+        Instructions:
+        - Provide a clear, concise answer based on the context
+        - Focus only on relevant information
+        - If the answer isn't in the context, say "I cannot answer this based on the provided context"
+        - Keep the response under 3-4 sentences unless absolutely necessary
+        - Use previous feedback to improve the answer
+        Answer:"""
+        
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+        return response.text.strip() if response else "I encountered an error while processing your question."
+    except Exception as e:
+        print(f"Error in query_llm: {str(e)}")
+        return "I apologize, but I encountered an error while processing your question. Please try again or check if the Gemini API is configured properly."
+
+def main():
+    if not login_ui():
+        return
+
+    st.title("📄 Multimodal RAG-powered PDF Q&A with DeepSeek-Vision")
+    st.write(f"Logged in as: {st.session_state.username} (Role: {st.session_state.role})")
+    
+    if st.button("Logout"):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.role = None
+        st.rerun()
+
+    role = st.session_state.role
+    
+    # Only show upload functionality to authorized users
+    if "upload" in ROLE_PERMISSIONS[role]:
+        uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+        
+        if uploaded_file:
+            with st.spinner("Processing document..."):
+                text, images = extract_text_and_images_from_pdf(uploaded_file)
+                image_texts = [extract_text_from_image(image) for image in images]
+                combined_text = text + "\n".join(image_texts)
+                
+                if combined_text:
+                    upload_text_to_blob("extracted_text.txt", combined_text)
+                
+                if not combined_text:
+                    st.error("No text or images could be extracted from the PDF.")
+                else:
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+                    text_chunks = text_splitter.split_text(combined_text)
+                    faiss_index = create_faiss_index(text_chunks)
+                    st.session_state.faiss_index = faiss_index
+                    st.success("PDF processed! You can now ask questions.")
+
+    # Show query functionality to authorized users
+    if "query" in ROLE_PERMISSIONS[role] and hasattr(st.session_state, 'faiss_index'):
+        query = st.text_input("Ask a question about the document:")
+        if query:
+            with st.spinner("Searching for answers..."):
+                docs = st.session_state.faiss_index.similarity_search(query, k=3)
+                context = "\n\n".join([doc.page_content for doc in docs])
+                answer = query_llm(query, context, load_feedback())
+                st.markdown(f"### Answer:\n{answer}")
+
+            # Show feedback functionality to authorized users
+            if "feedback" in ROLE_PERMISSIONS[role]:
+                feedback_comments = st.text_area("Your feedback (optional):", "")
+                if st.button("Submit Feedback"):
+                    feedback_data = {
+                        "query": query,
+                        "context": context,
+                        "answer": answer,
+                        "comments": feedback_comments,
+                        "user": st.session_state.username
+                    }
+                    save_feedback(feedback_data)
+                    st.success("Thank you for your feedback!")
+
+    # Show feedback history to admin
+    if "view_all_feedback" in ROLE_PERMISSIONS[role]:
+        if st.button("View All Feedback"):
+            feedback_history = load_feedback()
+            st.write("### Feedback History")
+            for feedback in feedback_history:
+                st.write(f"User: {feedback.get('user', 'Anonymous')}")
+                st.write(f"Query: {feedback['query']}")
+                st.write(f"Answer: {feedback['answer']}")
+                st.write(f"Feedback: {feedback['comments']}")
+                st.write("---")
+
+if __name__ == "__main__":
+    main()
